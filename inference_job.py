@@ -118,6 +118,58 @@ def fetch_radar_data(
         raise
 
 
+MAX_PAGES_FETCH_ALL = 500
+
+
+def fetch_all_radar_data(
+    client: httpx.Client,
+    *,
+    rx_mac: Optional[str] = None,
+    room_id: Optional[str] = None,
+    building_id: Optional[str] = None,
+    page_size: int = FETCH_LIMIT,
+    max_pages: int = MAX_PAGES_FETCH_ALL,
+) -> List[Dict[str, Any]]:
+    """GET all radar data by paginating until hasMore is false. Returns list of normalized records."""
+    all_records: List[Dict[str, Any]] = []
+    offset = 0
+    for page in range(max_pages):
+        params = {"limit": page_size, "offset": offset}
+        if rx_mac:
+            params["rx_mac"] = rx_mac
+        if room_id is not None:
+            params["room_id"] = room_id
+        if building_id is not None:
+            params["building_id"] = building_id
+        try:
+            r = client.get(RADAR_DATA_URL, params=params, timeout=30.0)
+            r.raise_for_status()
+            data = r.json()
+        except httpx.HTTPError as e:
+            logger.exception("Failed to fetch radar data (page %d): %s", page + 1, e)
+            raise
+        except Exception as e:
+            logger.exception("Unexpected error fetching radar data (page %d): %s", page + 1, e)
+            raise
+        if not data.get("success") or "data" not in data:
+            logger.warning("Radar API returned success=false or no data on page %d", page + 1)
+            break
+        rows = data.get("data") or []
+        for row in rows:
+            rec = _normalize_record(row)
+            if rec and rec.get("csi_data") is not None:
+                all_records.append(rec)
+        pagination = data.get("pagination") or {}
+        has_more = pagination.get("hasMore", False)
+        if not has_more or len(rows) == 0:
+            break
+        offset += page_size
+    if page + 1 >= max_pages and (data.get("pagination") or {}).get("hasMore"):
+        logger.warning("Stopped after %d pages (max_pages=%d); more data may remain", max_pages, max_pages)
+    logger.info("Fetched %d total records in %d page(s)", len(all_records), page + 1)
+    return all_records
+
+
 def _group_by_location(records: List[Dict[str, Any]]) -> Dict[tuple, List[Dict[str, Any]]]:
     """Group by (room_id, building_id, rx_mac). Each group sorted by timestamp_ms ascending."""
     groups = {}
@@ -223,6 +275,29 @@ def run_once(
     """Fetch radar data, run inference, optionally POST results. Returns list of result dicts."""
     records = fetch_radar_data(
         client, rx_mac=rx_mac, room_id=room_id, building_id=building_id, limit=limit, offset=offset,
+    )
+    results = run_inference_for_records(records, engine, sequence_length=SEQUENCE_LENGTH)
+    write_results_to_local_dir(results)
+    post_results(client, results)
+    return results
+
+
+def run_once_all_data(
+    client: httpx.Client,
+    engine,
+    *,
+    rx_mac: Optional[str] = None,
+    room_id: Optional[str] = None,
+    building_id: Optional[str] = None,
+    page_size: int = FETCH_LIMIT,
+) -> List[Dict[str, Any]]:
+    """Fetch all radar data (paginate), run inference once, save and POST results. Returns list of result dicts."""
+    records = fetch_all_radar_data(
+        client,
+        rx_mac=rx_mac,
+        room_id=room_id,
+        building_id=building_id,
+        page_size=page_size,
     )
     results = run_inference_for_records(records, engine, sequence_length=SEQUENCE_LENGTH)
     write_results_to_local_dir(results)

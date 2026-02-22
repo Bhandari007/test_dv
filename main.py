@@ -23,7 +23,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 
 import config
-from inference_job import get_engine, run_once
+from inference_job import get_engine, run_once, run_once_all_data
 
 logging.basicConfig(
     level=logging.INFO,
@@ -119,6 +119,37 @@ async def run_inference(
         return {"results": results}
     except Exception as e:
         logger.exception("run_inference failed: %s", e)
+        return JSONResponse(status_code=500, content={"detail": str(e)})
+
+
+@app.post("/run-inference-all")
+async def run_inference_all(
+    rx_mac: str | None = Query(None),
+    room_id: str | None = Query(None),
+    building_id: str | None = Query(None),
+):
+    """
+    Fetch all radar data (paginate until hasMore is false), run inference once, return and optionally POST results.
+    Same optional filters and save/POST behavior as /run-inference.
+    """
+    if _engine is None:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Model not loaded; set MODEL_PATH and SCALER_PATH"},
+        )
+    import httpx
+    try:
+        with httpx.Client() as client:
+            results = run_once_all_data(
+                client,
+                _engine,
+                rx_mac=rx_mac,
+                room_id=room_id,
+                building_id=building_id,
+            )
+        return {"results": results}
+    except Exception as e:
+        logger.exception("run_inference_all failed: %s", e)
         return JSONResponse(status_code=500, content={"detail": str(e)})
 
 
