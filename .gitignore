@@ -1,0 +1,5 @@
+models/
+tests/
+.env
+README.md
+__pycache__/

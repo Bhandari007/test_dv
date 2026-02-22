@@ -1,0 +1,23 @@
+[project]
+name = "occupancy-service"
+version = "0.1.0"
+description = "FastAPI service for radar-based occupancy inference"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "httpx>=0.27.0",
+    "python-dotenv>=1.0.0",
+    "apscheduler>=3.10.0",
+    "numpy>=2.0.0",
+    "torch>=2.0.0",
+    "scikit-learn>=1.0.0",
+    "pytest>=8.0.0",
+]
+
+[project.optional-dependencies]
+dev = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
