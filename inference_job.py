@@ -1,6 +1,6 @@
 """
 Fetch radar data, group by location, build sequences, run inference, format and optionally POST results.
-All feature engineering is delegated to inference_code.real_time_inference (record-based path).
+Feature extraction and model inference are self-contained in this service (no inference_code dependency).
 """
 import json
 import logging
@@ -19,27 +19,11 @@ from config import (
     RADAR_DATA_URL,
     REPO_ROOT,
 )
+from feature_extractor import CSIFeatureExtractor
+from inference_config import SEQUENCE_LENGTH
+from model_engine import InferenceEngine
 
 logger = logging.getLogger(__name__)
-
-# Lazy import after path is set in main
-_inference_engine = None
-_Config = None
-_CSIFeatureExtractor = None
-
-
-def _ensure_imports():
-    global _inference_engine, _Config, _CSIFeatureExtractor
-    if _Config is not None:
-        return
-    from inference_code.real_time_inference import (
-        Config as _C,
-        CSIFeatureExtractor as _E,
-        InferenceEngine as _IE,
-    )
-    _Config = _C
-    _CSIFeatureExtractor = _E
-    _inference_engine = _IE
 
 
 def _model_path_for_engine(model_path: str) -> str:
@@ -62,7 +46,6 @@ def _model_path_for_engine(model_path: str) -> str:
 
 def get_engine(model_path: str, scaler_path: str):
     """Load and return InferenceEngine (call once at startup)."""
-    _ensure_imports()
     p = Path(model_path)
     if not p.is_absolute():
         p = REPO_ROOT / model_path
@@ -70,7 +53,7 @@ def get_engine(model_path: str, scaler_path: str):
     if not s.is_absolute():
         s = REPO_ROOT / scaler_path
     path_to_use = _model_path_for_engine(str(p))
-    return _inference_engine(path_to_use, str(s), receiver_name="api", device="cpu")
+    return InferenceEngine(path_to_use, str(s), receiver_name="api", device="cpu")
 
 
 def _normalize_record(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -149,14 +132,14 @@ def _group_by_location(records: List[Dict[str, Any]]) -> Dict[tuple, List[Dict[s
 def run_inference_for_records(
     records: List[Dict[str, Any]],
     engine,
-    sequence_length: int = 30,
+    sequence_length: int = None,
 ) -> List[Dict[str, Any]]:
     """
     Group records by (room_id, building_id, rx_mac). For each group with >= sequence_length
-    packets, build sequence, predict, and append one result. Uses record-based feature
-    extraction from real_time_inference.
+    packets, build sequence, predict, and append one result.
     """
-    _ensure_imports()
+    if sequence_length is None:
+        sequence_length = SEQUENCE_LENGTH
     groups = _group_by_location(records)
     results = []
     for (room_id, building_id, rx_mac), group_records in groups.items():
@@ -168,7 +151,7 @@ def run_inference_for_records(
             continue
         # Use last `sequence_length` packets in time order
         window = group_records[-sequence_length:]
-        extractor = _CSIFeatureExtractor()
+        extractor = CSIFeatureExtractor()
         for rec in window:
             extractor.extract_packet_features_from_record(rec)
         seq = extractor.get_sequence_features()
@@ -241,9 +224,7 @@ def run_once(
     records = fetch_radar_data(
         client, rx_mac=rx_mac, room_id=room_id, building_id=building_id, limit=limit, offset=offset,
     )
-    _ensure_imports()
-    seq_len = getattr(_Config, "SEQUENCE_LENGTH", 30)
-    results = run_inference_for_records(records, engine, sequence_length=seq_len)
+    results = run_inference_for_records(records, engine, sequence_length=SEQUENCE_LENGTH)
     write_results_to_local_dir(results)
     post_results(client, results)
     return results

@@ -7,6 +7,8 @@ import logging
 import os
 import sys
 from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv()
 
 # Add repo root (inference_code) and this app dir (config, inference_job)
 _app_dir = Path(__file__).resolve().parent
