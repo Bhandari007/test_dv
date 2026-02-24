@@ -19,12 +19,90 @@ from config import (
     INFERENCE_RESULTS_URL,
     RADAR_DATA_URL,
     REPO_ROOT,
+    INFERENCE_WATERMARK_FILE,
 )
 from feature_extractor import CSIFeatureExtractor
 from inference_config import SEQUENCE_LENGTH
 from model_engine import InferenceEngine
 
 logger = logging.getLogger(__name__)
+
+
+def _timestamp_to_datetime(ts: Any) -> datetime:
+    """
+    Convert a numeric timestamp (seconds or milliseconds since epoch) to an aware UTC datetime.
+
+    Heuristic:
+    - If value looks like Unix seconds (1e9–2e9), treat it as seconds.
+    - Otherwise treat it as milliseconds.
+    """
+    try:
+        ts_float = float(ts)
+    except (TypeError, ValueError):
+        # Fallback to epoch start for clearly invalid values
+        return datetime.fromtimestamp(0, tz=timezone.utc)
+    if 1e9 <= ts_float <= 2e9:
+        seconds = ts_float
+    else:
+        seconds = ts_float / 1000.0
+    return datetime.fromtimestamp(seconds, tz=timezone.utc)
+
+
+def _location_key(room_id: Any, building_id: Any, rx_mac: str) -> str:
+    """Build a stable key for watermark per location."""
+    return f"{room_id}|{building_id}|{rx_mac or ''}"
+
+
+def _load_watermark(path: str | None = None) -> Dict[str, int]:
+    """
+    Load watermark from JSON file.
+
+    Returns mapping: location_key -> last_timestamp_end_ms (int).
+    """
+    import os
+
+    watermark_path = Path(path or INFERENCE_WATERMARK_FILE)
+    if not watermark_path.exists():
+        return {}
+    try:
+        text = watermark_path.read_text(encoding="utf-8")
+        data = json.loads(text or "{}")
+        if not isinstance(data, dict):
+            return {}
+        result: Dict[str, int] = {}
+        for key, value in data.items():
+            try:
+                result[str(key)] = int(value)
+            except (TypeError, ValueError):
+                continue
+        return result
+    except Exception as e:
+        logger.warning("Failed to load watermark file %s: %s", watermark_path, e)
+        return {}
+
+
+def _save_watermark(path: str | None, watermark: Dict[str, int]) -> None:
+    """Persist watermark mapping to JSON file (best-effort, atomic where possible)."""
+    watermark_path = Path(path or INFERENCE_WATERMARK_FILE)
+    try:
+        watermark_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = watermark_path.with_suffix(watermark_path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(watermark, indent=2, sort_keys=True), encoding="utf-8")
+        tmp_path.replace(watermark_path)
+        logger.info("Updated watermark file: %s", watermark_path)
+    except Exception as e:
+        logger.warning("Failed to write watermark file %s: %s", watermark_path, e)
+
+
+def _iso_timestamp_to_ms(ts_iso: str) -> int:
+    """Convert ISO 8601 timestamp to milliseconds since epoch."""
+    try:
+        dt = datetime.fromisoformat(ts_iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return 0
 
 
 def _model_path_for_engine(model_path: str) -> str:
@@ -211,6 +289,7 @@ def fetch_radar_data_from_db(
     building_id: Optional[str] = None,
     limit: int = FETCH_LIMIT,
     offset: int = 0,
+    min_timestamp_ms: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Fetch latest radar data from PostgreSQL radar_readings (ORDER BY timestamp_ms DESC). Returns normalized records."""
     import psycopg
@@ -231,6 +310,9 @@ def fetch_radar_data_from_db(
     if building_id is not None:
         conditions.append("building_id = %s")
         params.append(building_id)
+    if min_timestamp_ms is not None:
+        conditions.append("timestamp_ms > %s")
+        params.append(min_timestamp_ms)
     params.extend([limit, offset])
     sql = f"""
         SELECT rx_mac, room_id, building_id, timestamp_ms, rssi, channel, csi_data
@@ -308,21 +390,49 @@ def run_inference_for_records(
     sequence_length: int = None,
 ) -> List[Dict[str, Any]]:
     """
-    Group records by (room_id, building_id, rx_mac). For each group with >= sequence_length
-    packets, build sequence, predict, and append one result.
+    Group records by (room_id, building_id, rx_mac).
+
+    - For each group with >= sequence_length packets, build sequence, predict, and append one result.
+    - For groups with insufficient packets, append a result with occupied/occupied_probability set to None
+      so that downstream auditing can see that no prediction was made.
     """
     if sequence_length is None:
         sequence_length = SEQUENCE_LENGTH
     groups = _group_by_location(records)
     results = []
     for (room_id, building_id, rx_mac), group_records in groups.items():
+        if not group_records:
+            continue
+        # Compute timestamps for the group from raw packet timestamps
+        first_ts_ms = group_records[0]["timestamp_ms"]
+        last_ts_ms = group_records[-1]["timestamp_ms"]
+        ts_start = _timestamp_to_datetime(first_ts_ms)
+        ts_end = _timestamp_to_datetime(last_ts_ms)
+
         if len(group_records) < sequence_length:
-            logger.debug(
-                "Skipping group (%s, %s, %s): only %d packets (need %d)",
-                room_id, building_id, rx_mac, len(group_records), sequence_length,
+            logger.info(
+                "Insufficient packets for (%s, %s, %s): only %d packets (need %d); "
+                "writing occupied=False and probability=0.0 for auditing (skipped inference)",
+                room_id,
+                building_id,
+                rx_mac,
+                len(group_records),
+                sequence_length,
+            )
+            results.append(
+                {
+                    "timestamp_start": ts_start.isoformat(),
+                    "timestamp_end": ts_end.isoformat(),
+                    "room_id": room_id,
+                    "building_id": building_id,
+                    "occupied": False,
+                    "occupied_probability": 0.0,
+                    "rx_mac": rx_mac,
+                }
             )
             continue
-        # Use last `sequence_length` packets in time order
+
+        # Use last `sequence_length` packets in time order for inference
         window = group_records[-sequence_length:]
         extractor = CSIFeatureExtractor()
         for rec in window:
@@ -338,17 +448,19 @@ def run_inference_for_records(
             continue
         ts_start_ms = seq["timestamp_start"]
         ts_end_ms = seq["timestamp_end"]
-        ts_start = datetime.fromtimestamp(ts_start_ms / 1000.0, tz=timezone.utc)
-        ts_end = datetime.fromtimestamp(ts_end_ms / 1000.0, tz=timezone.utc)
-        results.append({
-            "timestamp_start": ts_start.isoformat(),
-            "timestamp_end": ts_end.isoformat(),
-            "room_id": room_id,
-            "building_id": building_id,
-            "occupied": occupied,
-            "occupied_probability": round(float(prob), 6),
-            "rx_mac": rx_mac,
-        })
+        ts_start = _timestamp_to_datetime(ts_start_ms)
+        ts_end = _timestamp_to_datetime(ts_end_ms)
+        results.append(
+            {
+                "timestamp_start": ts_start.isoformat(),
+                "timestamp_end": ts_end.isoformat(),
+                "room_id": room_id,
+                "building_id": building_id,
+                "occupied": occupied,
+                "occupied_probability": round(float(prob), 6),
+                "rx_mac": rx_mac,
+            }
+        )
     return results
 
 
@@ -448,6 +560,7 @@ def run_once_db(
         building_id=building_id,
         limit=limit,
         offset=offset,
+        min_timestamp_ms=None,
     )
     logger.info("run_once_db: got %d records, running inference", len(records))
     results = run_inference_for_records(records, engine, sequence_length=SEQUENCE_LENGTH)
@@ -455,6 +568,104 @@ def run_once_db(
     insert_inference_results(conn, results)
     write_results_to_local_dir(results)
     return results
+
+
+def _filter_results_with_watermark(
+    results: List[Dict[str, Any]],
+    watermark: Dict[str, int],
+) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """
+    Filter out results that are not newer than the watermark for their location.
+
+    Returns (filtered_results, updated_watermark).
+    """
+    updated = dict(watermark)
+    filtered: List[Dict[str, Any]] = []
+    for r in results:
+        key = _location_key(r["room_id"], r["building_id"], r["rx_mac"])
+        ts_end_ms = _iso_timestamp_to_ms(r["timestamp_end"])
+        last_ms = updated.get(key)
+        if last_ms is not None and ts_end_ms <= last_ms:
+            logger.info(
+                "Skipping result for (%s): timestamp_end %s (ms=%s) not newer than watermark %s",
+                key,
+                r["timestamp_end"],
+                ts_end_ms,
+                last_ms,
+            )
+            continue
+        filtered.append(r)
+        updated[key] = ts_end_ms
+    return filtered, updated
+
+
+def run_once_db_incremental(
+    engine: Any,
+    *,
+    rx_mac: Optional[str] = None,
+    room_id: Optional[str] = None,
+    building_id: Optional[str] = None,
+    limit: int = FETCH_LIMIT,
+    offset: int = 0,
+    watermark_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Incremental DB-based inference for the scheduler.
+
+    - Loads per-location watermark (last timestamp_end in ms) from file.
+    - Optionally fetches only radar_readings newer than the global minimum watermark.
+    - Runs inference (including NULL-occupied rows for insufficient packets).
+    - Filters out results that are not newer than each location's watermark.
+    - Inserts only new results into inference_data and updates the watermark file.
+    """
+    from db import get_connection
+
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL is not set; run_once_db_incremental requires a DB")
+
+    watermark_file = watermark_path or INFERENCE_WATERMARK_FILE
+    watermark = _load_watermark(watermark_file)
+    min_timestamp_ms = min(watermark.values()) if watermark else None
+
+    logger.info(
+        "run_once_db_incremental started (limit=%s, offset=%s, rx_mac=%s, room_id=%s, building_id=%s, min_timestamp_ms=%s)",
+        limit,
+        offset,
+        rx_mac,
+        room_id,
+        building_id,
+        min_timestamp_ms,
+    )
+
+    with get_connection() as conn:
+        records = fetch_radar_data_from_db(
+            conn,
+            rx_mac=rx_mac,
+            room_id=room_id,
+            building_id=building_id,
+            limit=limit,
+            offset=offset,
+            min_timestamp_ms=min_timestamp_ms,
+        )
+        logger.info("run_once_db_incremental: got %d records, running inference", len(records))
+        results = run_inference_for_records(records, engine, sequence_length=SEQUENCE_LENGTH)
+        if not results:
+            logger.info("run_once_db_incremental: no results produced; nothing to insert into inference_data")
+            return []
+
+        filtered, updated_watermark = _filter_results_with_watermark(results, watermark)
+        if not filtered:
+            logger.info(
+                "run_once_db_incremental: no new inference windows after watermark; nothing inserted into inference_data",
+            )
+            # Still persist updated watermark in case structure changed
+            _save_watermark(watermark_file, updated_watermark)
+            return []
+
+        insert_inference_results(conn, filtered)
+
+    _save_watermark(watermark_file, updated_watermark)
+    return filtered
 
 
 def run_once_all_data_db(

@@ -17,7 +17,14 @@ from fastapi.responses import JSONResponse
 
 import config
 from db import get_connection
-from inference_job import get_engine, run_once, run_once_all_data, run_once_all_data_db, run_once_db
+from inference_job import (
+    get_engine,
+    run_once,
+    run_once_all_data,
+    run_once_all_data_db,
+    run_once_db,
+    run_once_db_incremental,
+)
 
 _log_format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 logging.basicConfig(
@@ -217,9 +224,8 @@ def _scheduled_job():
     logger.info("Scheduled inference job starting")
     try:
         if config.DATABASE_URL:
-            logger.info("Using DB")
-            with get_connection() as conn:
-                run_once_db(conn, _engine)
+            logger.info("Using DB (incremental)")
+            run_once_db_incremental(_engine)
         else:
             logger.info("Using radar API")
             import httpx

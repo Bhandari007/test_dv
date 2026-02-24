@@ -2,8 +2,9 @@
 import os
 from pathlib import Path
 
-# Repo root (Darwin) for model/scaler paths and inference_code imports
-REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Root of this repository (used for resolving relative paths)
+REPO_ROOT = Path(__file__).resolve().parent
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 RADAR_DATA_URL = os.getenv("RADAR_DATA_URL", "http://localhost:3000/api/radar-data")
@@ -15,3 +16,9 @@ FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", "500"))
 RUN_SCHEDULER = os.getenv("RUN_SCHEDULER", "true").lower() in ("1", "true", "yes")
 INFERENCE_INTERVAL_SECONDS = int(os.getenv("INFERENCE_INTERVAL_SECONDS", "15"))
 LOG_FILE = os.getenv("LOG_FILE", "")  # When set, logs are also written to this file (with rotation)
+
+# Optional: file-based watermark for incremental DB inference (per-location last timestamp_end in ms)
+INFERENCE_WATERMARK_FILE = os.getenv(
+    "INFERENCE_WATERMARK_FILE",
+    str(REPO_ROOT / "inference_watermark.json"),
+)
