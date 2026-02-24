@@ -13,6 +13,7 @@ dependencies = [
     "torch>=2.0.0",
     "scikit-learn>=1.0.0",
     "pytest>=8.0.0",
+    "psycopg[binary]>=3.0.0",
 ]
 
 [project.optional-dependencies]

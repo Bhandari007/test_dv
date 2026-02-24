@@ -13,6 +13,7 @@ import httpx
 import torch
 
 from config import (
+    DATABASE_URL,
     FETCH_LIMIT,
     INFERENCE_RESULTS_DIR,
     INFERENCE_RESULTS_URL,
@@ -54,6 +55,38 @@ def get_engine(model_path: str, scaler_path: str):
         s = REPO_ROOT / scaler_path
     path_to_use = _model_path_for_engine(str(p))
     return InferenceEngine(path_to_use, str(s), receiver_name="api", device="cpu")
+
+
+def _normalize_db_row(row: Any) -> Optional[Dict[str, Any]]:
+    """Map a DB row (radar_readings) to the same normalized record shape as _normalize_record."""
+    try:
+        # row can be a dict (from cursor with row_factory) or a sequence
+        if hasattr(row, "keys"):
+            raw = dict(row)
+        else:
+            # Assume row is tuple-like; we need column names - use cursor.description
+            raise TypeError("DB row must be a dict-like mapping")
+        ts = raw.get("timestamp_ms")
+        if ts is None:
+            return None
+        if isinstance(ts, str):
+            ts = int(ts)
+        rssi = raw.get("rssi", -70)
+        if isinstance(rssi, str):
+            rssi = int(rssi)
+        # radar_targets: feature extractor expects list of sensor dicts; DB has ld2450_targets, rd03d_targets (JSON)
+        radar_targets = raw.get("radar_targets") or raw.get("ld2450_targets") or raw.get("rd03d_targets")
+        return {
+            "rx_mac": raw.get("rx_mac") or "",
+            "room_id": raw.get("room_id"),
+            "building_id": raw.get("building_id"),
+            "timestamp_ms": ts,
+            "rssi": rssi,
+            "csi_data": raw.get("csi_data"),
+            "radar_targets": radar_targets,
+        }
+    except (TypeError, ValueError, KeyError):
+        return None
 
 
 def _normalize_record(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -168,6 +201,94 @@ def fetch_all_radar_data(
         logger.warning("Stopped after %d pages (max_pages=%d); more data may remain", max_pages, max_pages)
     logger.info("Fetched %d total records in %d page(s)", len(all_records), page + 1)
     return all_records
+
+
+def fetch_radar_data_from_db(
+    conn: Any,
+    *,
+    rx_mac: Optional[str] = None,
+    room_id: Optional[str] = None,
+    building_id: Optional[str] = None,
+    limit: int = FETCH_LIMIT,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    """Fetch latest radar data from PostgreSQL radar_readings (ORDER BY timestamp_ms DESC). Returns normalized records."""
+    import psycopg
+    from psycopg.rows import dict_row
+
+    logger.info(
+        "Fetching radar_readings from DB (limit=%s, offset=%s, filters: rx_mac=%s, room_id=%s, building_id=%s)",
+        limit, offset, rx_mac, room_id, building_id,
+    )
+    conditions = ["1=1"]
+    params: List[Any] = []
+    if rx_mac:
+        conditions.append("rx_mac = %s")
+        params.append(rx_mac)
+    if room_id is not None:
+        conditions.append("room_id = %s")
+        params.append(room_id)
+    if building_id is not None:
+        conditions.append("building_id = %s")
+        params.append(building_id)
+    params.extend([limit, offset])
+    sql = f"""
+        SELECT rx_mac, room_id, building_id, timestamp_ms, rssi, channel, csi_data
+        FROM radar_readings
+        WHERE {" AND ".join(conditions)}
+        ORDER BY timestamp_ms DESC
+        LIMIT %s OFFSET %s
+    """
+    normalized = []
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+            raw_count = len(rows)
+            for row in rows:
+                rec = _normalize_db_row(row)
+                if rec and rec.get("csi_data") is not None:
+                    normalized.append(rec)
+        logger.info(
+            "Fetched %d record(s) from radar_readings (%d with valid csi_data)",
+            raw_count, len(normalized),
+        )
+    except Exception as e:
+        logger.exception("Failed to fetch radar_readings: %s", e)
+        raise
+    return normalized
+
+
+def insert_inference_results(conn: Any, results: List[Dict[str, Any]]) -> None:
+    """Insert inference result dicts into the inference_data table."""
+    if not results:
+        return
+    import psycopg
+
+    logger.debug("Inserting %d result(s) into inference_data", len(results))
+    sql = """
+        INSERT INTO inference_data (timestamp_start, timestamp_end, room_id, building_id, occupied, occupied_probability, rx_mac)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """
+    try:
+        with conn.cursor() as cur:
+            for r in results:
+                cur.execute(
+                    sql,
+                    (
+                        r["timestamp_start"],
+                        r["timestamp_end"],
+                        r["room_id"],
+                        r["building_id"],
+                        r["occupied"],
+                        r["occupied_probability"],
+                        r["rx_mac"],
+                    ),
+                )
+        logger.info("Inserted %d inference result(s) into inference_data", len(results))
+    except Exception as e:
+        logger.exception("Failed to insert into inference_data: %s", e)
+        raise
 
 
 def _group_by_location(records: List[Dict[str, Any]]) -> Dict[tuple, List[Dict[str, Any]]]:
@@ -302,4 +423,73 @@ def run_once_all_data(
     results = run_inference_for_records(records, engine, sequence_length=SEQUENCE_LENGTH)
     write_results_to_local_dir(results)
     post_results(client, results)
+    return results
+
+
+def run_once_db(
+    conn: Any,
+    engine: Any,
+    *,
+    rx_mac: Optional[str] = None,
+    room_id: Optional[str] = None,
+    building_id: Optional[str] = None,
+    limit: int = FETCH_LIMIT,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    """Fetch latest radar data from DB, run inference, insert into inference_data. Returns list of result dicts."""
+    logger.info(
+        "run_once_db started (limit=%s, offset=%s, rx_mac=%s, room_id=%s, building_id=%s)",
+        limit, offset, rx_mac, room_id, building_id,
+    )
+    records = fetch_radar_data_from_db(
+        conn,
+        rx_mac=rx_mac,
+        room_id=room_id,
+        building_id=building_id,
+        limit=limit,
+        offset=offset,
+    )
+    logger.info("run_once_db: got %d records, running inference", len(records))
+    results = run_inference_for_records(records, engine, sequence_length=SEQUENCE_LENGTH)
+    logger.info("run_once_db: inference produced %d result(s)", len(results))
+    insert_inference_results(conn, results)
+    write_results_to_local_dir(results)
+    return results
+
+
+def run_once_all_data_db(
+    conn: Any,
+    engine: Any,
+    *,
+    rx_mac: Optional[str] = None,
+    room_id: Optional[str] = None,
+    building_id: Optional[str] = None,
+    page_size: int = FETCH_LIMIT,
+    max_pages: int = MAX_PAGES_FETCH_ALL,
+) -> List[Dict[str, Any]]:
+    """Fetch all radar data from DB (paginate), run inference once, insert into inference_data. Returns result dicts."""
+    logger.info(
+        "run_once_all_data_db started (filters: rx_mac=%s, room_id=%s, building_id=%s)",
+        rx_mac, room_id, building_id,
+    )
+    all_records: List[Dict[str, Any]] = []
+    offset = 0
+    for _ in range(max_pages):
+        page = fetch_radar_data_from_db(
+            conn,
+            rx_mac=rx_mac,
+            room_id=room_id,
+            building_id=building_id,
+            limit=page_size,
+            offset=offset,
+        )
+        if not page:
+            break
+        all_records.extend(page)
+        offset += page_size
+    logger.info("Fetched %d total records from DB in %d page(s)", len(all_records), (offset // page_size) or 1)
+    results = run_inference_for_records(all_records, engine, sequence_length=SEQUENCE_LENGTH)
+    logger.info("run_once_all_data_db: inference produced %d result(s)", len(results))
+    insert_inference_results(conn, results)
+    write_results_to_local_dir(results)
     return results
