@@ -4,14 +4,16 @@ Run from occupancy-service: uv run uvicorn main:app --host 0.0.0.0 --port 8000
 """
 import logging
 import os
+from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from dotenv import load_dotenv
+
 load_dotenv()
 
-from contextlib import asynccontextmanager
-
+import httpx
+from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 
@@ -62,7 +64,6 @@ async def lifespan(app: FastAPI):
             _engine = get_engine(model_path, scaler_path)
             logger.info("Model and scaler loaded")
             if config.RUN_SCHEDULER:
-                from apscheduler.schedulers.background import BackgroundScheduler
                 _scheduler = BackgroundScheduler()
                 _scheduler.add_job(
                     _scheduled_job,
@@ -104,7 +105,6 @@ async def health():
             logger.info("Health check: database unreachable: %s", e)
     else:
         try:
-            import httpx
             r = httpx.get(config.RADAR_DATA_URL, params={"limit": 1}, timeout=5.0)
             radar_ok = r.status_code == 200 and r.json().get("success") is True
         except Exception:
@@ -153,7 +153,6 @@ async def run_inference(
                 )
         else:
             logger.info("Using radar API")
-            import httpx
             with httpx.Client() as client:
                 results = run_once(
                     client,
@@ -202,7 +201,6 @@ async def run_inference_all(
                 )
         else:
             logger.info("Using radar API")
-            import httpx
             with httpx.Client() as client:
                 results = run_once_all_data(
                     client,
@@ -228,7 +226,6 @@ def _scheduled_job():
             run_once_db_incremental(_engine)
         else:
             logger.info("Using radar API")
-            import httpx
             with httpx.Client() as client:
                 run_once(client, _engine)
     except Exception as e:

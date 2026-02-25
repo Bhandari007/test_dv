@@ -4,13 +4,16 @@ Feature extraction and model inference are self-contained in this service (no in
 """
 import json
 import logging
+import os
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
+import psycopg
 import torch
+from psycopg.rows import dict_row
 
 from config import (
     DATABASE_URL,
@@ -21,6 +24,7 @@ from config import (
     REPO_ROOT,
     INFERENCE_WATERMARK_FILE,
 )
+from db import get_connection
 from feature_extractor import CSIFeatureExtractor
 from inference_config import SEQUENCE_LENGTH
 from model_engine import InferenceEngine
@@ -59,8 +63,6 @@ def _load_watermark(path: str | None = None) -> Dict[str, int]:
 
     Returns mapping: location_key -> last_timestamp_end_ms (int).
     """
-    import os
-
     watermark_path = Path(path or INFERENCE_WATERMARK_FILE)
     if not watermark_path.exists():
         return {}
@@ -292,9 +294,6 @@ def fetch_radar_data_from_db(
     min_timestamp_ms: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Fetch latest radar data from PostgreSQL radar_readings (ORDER BY timestamp_ms DESC). Returns normalized records."""
-    import psycopg
-    from psycopg.rows import dict_row
-
     logger.info(
         "Fetching radar_readings from DB (limit=%s, offset=%s, filters: rx_mac=%s, room_id=%s, building_id=%s)",
         limit, offset, rx_mac, room_id, building_id,
@@ -345,7 +344,6 @@ def insert_inference_results(conn: Any, results: List[Dict[str, Any]]) -> None:
     """Insert inference result dicts into the inference_data table."""
     if not results:
         return
-    import psycopg
 
     logger.debug("Inserting %d result(s) into inference_data", len(results))
     sql = """
@@ -454,7 +452,6 @@ def run_inference_for_records(
 
 def write_results_to_local_dir(results: List[Dict[str, Any]]) -> None:
     """Write inference results to INFERENCE_RESULTS_DIR as a timestamped JSON file."""
-    import os
     out_dir_str = os.getenv("INFERENCE_RESULTS_DIR", "") or INFERENCE_RESULTS_DIR
     if not out_dir_str or not results:
         return
@@ -602,12 +599,10 @@ def run_once_db_incremental(
 
     - Loads per-location watermark (last timestamp_end in ms) from file.
     - Optionally fetches only radar_readings newer than the global minimum watermark.
-    - Runs inference (including NULL-occupied rows for insufficient packets).
+    - Runs inference (logs and skips groups with insufficient packets).
     - Filters out results that are not newer than each location's watermark.
     - Inserts only new results into inference_data and updates the watermark file.
     """
-    from db import get_connection
-
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL is not set; run_once_db_incremental requires a DB")
 

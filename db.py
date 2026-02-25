@@ -1,8 +1,10 @@
 """PostgreSQL connection helper for occupancy inference (read radar_readings, write inference_data)."""
 import logging
 from contextlib import contextmanager
-from urllib.parse import urlparse
 from typing import Any, Generator
+from urllib.parse import urlparse
+
+import psycopg
 
 import config
 
@@ -31,7 +33,6 @@ def get_connection() -> Generator[Any, None, None]:
     """Yield a psycopg connection from DATABASE_URL. Closes on exit."""
     if not config.DATABASE_URL:
         raise ValueError("DATABASE_URL is not set")
-    import psycopg
     db_info = _sanitized_db_info()
     try:
         conn = psycopg.connect(config.DATABASE_URL)
