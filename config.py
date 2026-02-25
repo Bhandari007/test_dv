@@ -17,10 +17,6 @@ RUN_SCHEDULER = os.getenv("RUN_SCHEDULER", "true").lower() in ("1", "true", "yes
 INFERENCE_INTERVAL_SECONDS = int(os.getenv("INFERENCE_INTERVAL_SECONDS", "15"))
 LOG_FILE = os.getenv("LOG_FILE", "")  # When set, logs are also written to this file (with rotation)
 
-# Optional per-location cap for incremental DB inference (rows per location per run).
-_per_location_limit = os.getenv("PER_LOCATION_FETCH_LIMIT", "").strip()
-PER_LOCATION_FETCH_LIMIT = int(_per_location_limit) if _per_location_limit else None
-
 # Optional: file-based watermark for incremental DB inference (per-location last timestamp_end in ms)
 INFERENCE_WATERMARK_FILE = os.getenv(
     "INFERENCE_WATERMARK_FILE",
