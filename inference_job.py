@@ -411,24 +411,12 @@ def run_inference_for_records(
 
         if len(group_records) < sequence_length:
             logger.info(
-                "Insufficient packets for (%s, %s, %s): only %d packets (need %d); "
-                "writing occupied=False and probability=0.0 for auditing (skipped inference)",
+                "Insufficient packets for (%s, %s, %s): only %d packets (need %d); skipped inference",
                 room_id,
                 building_id,
                 rx_mac,
                 len(group_records),
                 sequence_length,
-            )
-            results.append(
-                {
-                    "timestamp_start": ts_start.isoformat(),
-                    "timestamp_end": ts_end.isoformat(),
-                    "room_id": room_id,
-                    "building_id": building_id,
-                    "occupied": False,
-                    "occupied_probability": 0.0,
-                    "rx_mac": rx_mac,
-                }
             )
             continue
 
