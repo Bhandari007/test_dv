@@ -23,6 +23,7 @@ from config import (
     RADAR_DATA_URL,
     REPO_ROOT,
     INFERENCE_WATERMARK_FILE,
+    PER_LOCATION_FETCH_LIMIT,
 )
 from db import get_connection
 from feature_extractor import CSIFeatureExtractor
@@ -289,14 +290,21 @@ def fetch_radar_data_from_db(
     rx_mac: Optional[str] = None,
     room_id: Optional[str] = None,
     building_id: Optional[str] = None,
-    limit: int = FETCH_LIMIT,
+    limit: Optional[int] = FETCH_LIMIT,
     offset: int = 0,
     min_timestamp_ms: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    """Fetch latest radar data from PostgreSQL radar_readings (ORDER BY timestamp_ms DESC). Returns normalized records."""
+    """Fetch latest radar data from PostgreSQL radar_readings (ORDER BY timestamp_ms DESC). Returns normalized records.
+
+    When limit is None, all matching rows are returned (no LIMIT/OFFSET clause).
+    """
     logger.info(
         "Fetching radar_readings from DB (limit=%s, offset=%s, filters: rx_mac=%s, room_id=%s, building_id=%s)",
-        limit, offset, rx_mac, room_id, building_id,
+        limit,
+        offset,
+        rx_mac,
+        room_id,
+        building_id,
     )
     conditions = ["1=1"]
     params: List[Any] = []
@@ -312,14 +320,21 @@ def fetch_radar_data_from_db(
     if min_timestamp_ms is not None:
         conditions.append("timestamp_ms > %s")
         params.append(min_timestamp_ms)
-    params.extend([limit, offset])
-    sql = f"""
+
+    base_sql = """
         SELECT rx_mac, room_id, building_id, timestamp_ms, rssi, channel, csi_data
         FROM radar_readings
-        WHERE {" AND ".join(conditions)}
+        WHERE {where_clause}
         ORDER BY timestamp_ms DESC
-        LIMIT %s OFFSET %s
     """
+    if limit is None:
+        sql = base_sql.format(where_clause=" AND ".join(conditions))
+    else:
+        params.extend([limit, offset])
+        sql = (
+            base_sql.format(where_clause=" AND ".join(conditions))
+            + "\n        LIMIT %s OFFSET %s"
+        )
     normalized = []
     try:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -332,12 +347,37 @@ def fetch_radar_data_from_db(
                     normalized.append(rec)
         logger.info(
             "Fetched %d record(s) from radar_readings (%d with valid csi_data)",
-            raw_count, len(normalized),
+            raw_count,
+            len(normalized),
         )
     except Exception as e:
         logger.exception("Failed to fetch radar_readings: %s", e)
         raise
     return normalized
+
+
+def get_distinct_locations(conn: Any) -> List[tuple]:
+    """
+    Return distinct (room_id, building_id, rx_mac) tuples present in radar_readings.
+
+    Locations with room_id NULL or 0 are skipped to avoid inserting inference_data rows
+    that would violate the rooms foreign key constraint.
+    """
+    sql = """
+        SELECT DISTINCT room_id, building_id, rx_mac
+        FROM radar_readings
+        WHERE room_id IS NOT NULL AND room_id <> 0
+        ORDER BY room_id, building_id, rx_mac
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+        logger.info("Found %d distinct location(s) in radar_readings", len(rows))
+        return rows
+    except Exception as e:
+        logger.exception("Failed to fetch distinct locations from radar_readings: %s", e)
+        raise
 
 
 def insert_inference_results(conn: Any, results: List[Dict[str, Any]]) -> None:
@@ -587,20 +627,15 @@ def _filter_results_with_watermark(
 def run_once_db_incremental(
     engine: Any,
     *,
-    rx_mac: Optional[str] = None,
-    room_id: Optional[str] = None,
-    building_id: Optional[str] = None,
-    limit: int = FETCH_LIMIT,
-    offset: int = 0,
     watermark_path: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Incremental DB-based inference for the scheduler.
+    Incremental DB-based inference for the scheduler (per-location, no global limit).
 
     - Loads per-location watermark (last timestamp_end in ms) from file.
-    - Optionally fetches only radar_readings newer than the global minimum watermark.
-    - Runs inference (logs and skips groups with insufficient packets).
-    - Filters out results that are not newer than each location's watermark.
+    - Discovers distinct (room_id, building_id, rx_mac) locations from radar_readings.
+    - For each location, fetches radar_readings newer than that location's watermark,
+      runs inference, and filters out results that are not newer than the watermark.
     - Inserts only new results into inference_data and updates the watermark file.
     """
     if not DATABASE_URL:
@@ -608,47 +643,77 @@ def run_once_db_incremental(
 
     watermark_file = watermark_path or INFERENCE_WATERMARK_FILE
     watermark = _load_watermark(watermark_file)
-    min_timestamp_ms = min(watermark.values()) if watermark else None
 
-    logger.info(
-        "run_once_db_incremental started (limit=%s, offset=%s, rx_mac=%s, room_id=%s, building_id=%s, min_timestamp_ms=%s)",
-        limit,
-        offset,
-        rx_mac,
-        room_id,
-        building_id,
-        min_timestamp_ms,
-    )
+    logger.info("run_once_db_incremental started (per-location, no global limit)")
+
+    per_location_limit = PER_LOCATION_FETCH_LIMIT
 
     with get_connection() as conn:
-        records = fetch_radar_data_from_db(
-            conn,
-            rx_mac=rx_mac,
-            room_id=room_id,
-            building_id=building_id,
-            limit=limit,
-            offset=offset,
-            min_timestamp_ms=min_timestamp_ms,
-        )
-        logger.info("run_once_db_incremental: got %d records, running inference", len(records))
-        results = run_inference_for_records(records, engine, sequence_length=SEQUENCE_LENGTH)
-        if not results:
-            logger.info("run_once_db_incremental: no results produced; nothing to insert into inference_data")
+        locations = get_distinct_locations(conn)
+        if not locations:
+            logger.info("run_once_db_incremental: no locations found in radar_readings; nothing to do")
             return []
 
-        filtered, updated_watermark = _filter_results_with_watermark(results, watermark)
-        if not filtered:
+        all_filtered_results: List[Dict[str, Any]] = []
+
+        for room_id, building_id, rx_mac in locations:
+            location_key = _location_key(room_id, building_id, rx_mac or "")
+            min_timestamp_ms = watermark.get(location_key)
+
             logger.info(
-                "run_once_db_incremental: no new inference windows after watermark; nothing inserted into inference_data",
+                "run_once_db_incremental: processing location=%s (min_timestamp_ms=%s, limit=%s)",
+                location_key,
+                min_timestamp_ms,
+                per_location_limit,
             )
-            # Still persist updated watermark in case structure changed
-            _save_watermark(watermark_file, updated_watermark)
+
+            records = fetch_radar_data_from_db(
+                conn,
+                rx_mac=rx_mac,
+                room_id=room_id,
+                building_id=building_id,
+                limit=per_location_limit,
+                offset=0,
+                min_timestamp_ms=min_timestamp_ms,
+            )
+            if not records:
+                logger.info("run_once_db_incremental: no new radar_readings for location=%s", location_key)
+                continue
+
+            logger.info(
+                "run_once_db_incremental: got %d record(s) for location=%s; running inference",
+                len(records),
+                location_key,
+            )
+            results = run_inference_for_records(records, engine, sequence_length=SEQUENCE_LENGTH)
+            if not results:
+                logger.info(
+                    "run_once_db_incremental: inference produced no results for location=%s; skipping insert",
+                    location_key,
+                )
+                continue
+
+            filtered, watermark = _filter_results_with_watermark(results, watermark)
+            if not filtered:
+                logger.info(
+                    "run_once_db_incremental: no new inference windows after watermark for location=%s",
+                    location_key,
+                )
+                continue
+
+            all_filtered_results.extend(filtered)
+
+        if not all_filtered_results:
+            logger.info(
+                "run_once_db_incremental: no new inference results for any location; nothing inserted into inference_data",
+            )
+            _save_watermark(watermark_file, watermark)
             return []
 
-        insert_inference_results(conn, filtered)
+        insert_inference_results(conn, all_filtered_results)
 
-    _save_watermark(watermark_file, updated_watermark)
-    return filtered
+    _save_watermark(watermark_file, watermark)
+    return all_filtered_results
 
 
 def run_once_all_data_db(
